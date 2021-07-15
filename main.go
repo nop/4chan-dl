@@ -1,9 +1,18 @@
+// TODO make things concurrent
+// TODO document everything
+// TODO improve logging
+// TODO use a progress bar?
+
 package main
 
 import (
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
@@ -28,56 +37,116 @@ func init() {
 }
 
 func main() {
-	link, err := url.Parse(os.Args[1])
+	// parse URL
+	u, err := url.Parse(os.Args[1])
 	if err != nil {
 		log.WithFields(log.Fields{
-			"url": link,
-		}).Fatal("unable to parse URL")
+			"url": u,
+		}).Error("unable to parse URL")
 	}
 
-	pth := strings.Split(link.Path, "/")[1:]
-	pthlog := log.WithFields(log.Fields{
-		"url":  link,
-		"path": pth,
-	})
-	if len(pth) != 3 {
-		pthlog.WithFields(log.Fields{
-			"expected_len": "3",
-			"len":          len(pth),
-		}).Fatal("invalid path length")
+	// check the URL for validity
+	if !(strings.Contains(u.Hostname(), "4chan.org") ||
+		strings.Contains(u.Hostname(), "4channel.org")) {
+		log.WithFields(log.Fields{
+			"url": u,
+		}).Error("4chan-dl only supports downloading from 4chan")
+	}
+	parts := strings.Split(u.Path[1:], "/")
+	board := parts[0]
+	tid := parts[2]
+	if parts[1] != "thread" {
+		log.WithFields(log.Fields{
+			"url": u,
+		}).Error("URL is not a thread")
 	}
 
-	if pth[1] != "thread" {
-		pthlog.WithFields(log.Fields{
-			"expected": "thread",
-			"actual":   pth[1],
-		}).Warn("unexpected pth[1]")
-	}
-
-	board := pth[0]
-	tid := pth[2]
-	log.Info("Board: ", board)
-	log.Info("Thread ID: ", tid)
-
-	// make file
-	outfile, err := os.Create("outfile.html")
+	// make requests
+	document, err := getPage(u)
 	if err != nil {
-		log.Fatal(err)
-	}
-	defer outfile.Close()
-
-	doc, err := getPage(link)
-	if err != nil {
-		log.Fatal(err)
+		log.WithFields(log.Fields{
+			"url": u,
+		}).Error("could not get page")
 	}
 
-	rootnode := doc.Find("form#delform div.board div.thread")
-	posts := rootnode.Find(".postContainer")
-	posts.Each(func(i int, s *goquery.Selection) {
-		log.Info(i, *s)
+	// parse DOM and extract links
+	links := document.Find(".thread .postContainer .file .fileText a")
+
+	images := make([]string, links.Size())
+
+	links.Each(func(i int, s *goquery.Selection) {
+		imgpath, exists := s.Attr("href")
+		if !exists {
+			log.WithFields(log.Fields{
+				"selection": s,
+			}).Error("href attribute does not exist")
+			// return
+		}
+		log.WithFields(log.Fields{
+			"index": i,
+			"text":  s.Text(),
+		}).Infof("found %s", imgpath)
+
+		// ignore the first two '//'
+		images[i] = "https:" + imgpath
 	})
-	log.Info("posts: ", posts)
 
+	log.Debug(images)
+
+	// create the thread dir
+	if _, err := os.Stat(board + "/" + tid); errors.Is(err, os.ErrNotExist) {
+		err := os.MkdirAll(board+"/"+tid, 0755)
+		if err != nil {
+			log.WithFields(log.Fields{
+				"path": board + "/" + tid,
+			}).Error(err)
+		}
+	}
+
+	for _, imageURL := range images {
+		// download images
+		image, err := getImage(imageURL)
+		if err != nil {
+			log.WithFields(log.Fields{
+				"image": imageURL,
+			}).Error(err)
+		}
+		defer image.Close()
+
+		// write images to disk
+		path := fmt.Sprintf("%s/%s/%s", board, tid, path.Base(imageURL))
+		file, err := os.Create(path)
+		if err != nil {
+			log.WithFields(log.Fields{
+				"path": path,
+			}).Error(err)
+		}
+		defer file.Close()
+
+		_, err = io.Copy(file, image)
+		if err != nil {
+			log.WithFields(log.Fields{
+				"path": path,
+			}).Error(err)
+		}
+
+		log.New().WithFields(log.Fields{
+			"file": file.Name(),
+		}).Info("Done writing file.")
+	}
+
+	log.Info(u.Path)
+	getPage(u)
+}
+
+func getImage(u string) (io.ReadCloser, error) {
+	res, err := http.Get(u)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"url": u,
+		}).Error(err)
+	}
+	return res.Body, err
 }
 
 // FIXME no timeout
@@ -98,8 +167,10 @@ func getPage(u *url.URL) (*goquery.Document, error) {
 		return nil, err
 	}
 	defer res.Body.Close()
+
 	if res.StatusCode != 200 {
 		log.WithFields(log.Fields{
+			"url":        u,
 			"statuscode": res.StatusCode,
 			"status":     res.Status,
 		}).Error("status code error")
